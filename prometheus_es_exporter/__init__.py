@@ -166,7 +166,6 @@ class IndicesStatsCollector(object):
         try:
             for index in self.indices:
                 response = self.es_client.indices.stats(index=index, metric=self.metrics, fields=self.fields, request_timeout=self.timeout)
-
                 metrics = indices_stats_parser.parse_response(response, self.parse_indices, self.metric_name_list)
                 metric_dict = group_metrics(metrics)
                 yield from gauge_generator(metric_dict)
@@ -244,6 +243,26 @@ def run_query(es_client, query_name, indices, query,
                                                  zero_missing=True)
 
         METRICS_BY_QUERY[query_name] = metric_dict
+
+
+def collect_indices_stats(es_client, indices, timeout, metrics=None, fields=None):
+    metric_name_list = ['es', 'indices_stats']
+    for index in indices:
+        query_name = 'index_stats_' + index
+        description = 'Indices Stats for index ;' + index
+        try:
+            response = es_client.indices.stats(index=index, metric=metrics, fields=fields, request_timeout=timeout)
+            metrics_name = indices_stats_parser.parse_response(response, True, metric_name_list)
+            metric_dict = group_metrics(metrics_name)
+            METRICS_BY_QUERY[query_name] = metric_dict
+        except ConnectionTimeout:
+            log.warning('Timeout while fetching %(description)s (timeout %(timeout_s)ss).',
+                        {'description': description, 'timeout_s': timeout})
+            METRICS_BY_QUERY[query_name] = {}
+        except Exception:
+            log.exception('Error while fetching %(description)s.',
+                          {'description': description})
+            METRICS_BY_QUERY[query_name] = {}
 
 
 # Based on click.Choice
@@ -506,8 +525,9 @@ def cli(**options):
                                   verify_certs=False,
                                   http_auth=http_auth)
 
-    scheduler = None
-    indices_for_stats = [] 
+    scheduler = sched.scheduler()
+    indices_for_stats = []
+    config = None
     if not options['query_disable']:
         config = configparser.ConfigParser(converters=CONFIGPARSER_CONVERTERS)
         config.read(options['config_file'])
@@ -517,7 +537,6 @@ def cli(**options):
         config.read(config_dir_sorted_files)
 
         query_prefix = 'query_'
-        indices_for_stats = config.get('INDICES_FOR_STATS_METRICS', 'indices', fallback='_all').split(',')
         queries = {}
         for section in config.sections():
             if section.startswith(query_prefix):
@@ -536,8 +555,6 @@ def cli(**options):
 
                 queries[query_name] = (interval, timeout, indices, query,
                                        on_error, on_missing)
-
-        scheduler = sched.scheduler()
 
         if queries:
             for query_name, (interval, timeout, indices, query,
@@ -575,6 +592,28 @@ def cli(**options):
                                                 parse_indices=parse_indices,
                                                 metrics=options['indices_stats_metrics'],
                                                 fields=options['indices_stats_fields']))
+
+    if config is None:
+        config = configparser.ConfigParser(converters=CONFIGPARSER_CONVERTERS)
+        config.read(options['config_file'])
+
+        config_dir_file_pattern = os.path.join(options['config_dir'], '*.cfg')
+        config_dir_sorted_files = sorted(glob.glob(config_dir_file_pattern))
+        config.read(config_dir_sorted_files)
+
+    config_name = 'INDICES_FOR_STATS_METRICS'
+    for section in config.sections():
+        if section.startswith(config_name):
+            interval = config.getfloat(section, 'QueryIntervalSecs',
+                                       fallback=15)
+            timeout = config.getfloat(section, 'QueryTimeoutSecs',
+                                      fallback=10)
+            indices = config.get(section, 'QueryIndices',
+                                 fallback='_all').split(',')
+            schedule_job(scheduler, interval, collect_indices_stats, es_client, indices, timeout,
+                         metrics=options['indices_stats_metrics'],
+                         fields=options['indices_stats_fields'])
+            break
 
     if scheduler:
         REGISTRY.register(QueryMetricCollector())
