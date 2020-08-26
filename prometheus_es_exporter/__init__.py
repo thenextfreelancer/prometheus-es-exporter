@@ -21,7 +21,7 @@ from . import indices_stats_parser
 from . import nodes_stats_parser
 from .metrics import (group_metrics, gauge_generator,
                       format_metric_name, merge_metric_dicts)
-from .parser import parse_response
+from .parser import parse_response, parse_parent_response
 from .scheduler import schedule_job
 from .utils import log_exceptions, nice_shutdown
 
@@ -204,6 +204,69 @@ def run_query(es_client, query_name, indices, query,
     except Exception:
         log.exception('Error while querying indices %(indices)s, query %(query)s.',
                       {'indices': indices, 'query': query})
+
+        # If this query has successfully run before, we need to handle any
+        # metrics produced by that previous run.
+        if query_name in METRICS_BY_QUERY:
+            old_metric_dict = METRICS_BY_QUERY[query_name]
+
+            if on_error == 'preserve':
+                metric_dict = old_metric_dict
+
+            elif on_error == 'drop':
+                metric_dict = {}
+
+            elif on_error == 'zero':
+                # Merging the old metric dict with an empty one, and zeroing
+                # any missing metrics, produces a metric dict with the same
+                # metrics, but all zero values.
+                metric_dict = merge_metric_dicts(old_metric_dict, {},
+                                                 zero_missing=True)
+
+            METRICS_BY_QUERY[query_name] = metric_dict
+
+    else:
+        # If this query has successfully run before, we need to handle any
+        # missing metrics.
+        if query_name in METRICS_BY_QUERY:
+            old_metric_dict = METRICS_BY_QUERY[query_name]
+
+            if on_missing == 'preserve':
+                metric_dict = merge_metric_dicts(old_metric_dict, metric_dict,
+                                                 zero_missing=False)
+
+            elif on_missing == 'drop':
+                pass  # use new metric dict untouched
+
+            elif on_missing == 'zero':
+                metric_dict = merge_metric_dicts(old_metric_dict, metric_dict,
+                                                 zero_missing=True)
+
+        METRICS_BY_QUERY[query_name] = metric_dict
+
+
+def run_chain_query(es_client, query_name, chain_query, timeout, on_error, on_missing):
+    parent_query_def = chain_query['query_parent_def']
+    parent_query = parent_query_def['query']
+    parent_query_index = parent_query_def['index']
+    parent_query_key = parent_query_def['key']
+
+    child_query_def = chain_query['query_child_def']
+    child_query_index = child_query_def['index']
+    child_query_key = child_query_def['key']
+    child_query = child_query_def['query']
+    try:
+        parent_response = es_client.search(index=parent_query_index, _source_includes=parent_query_key,
+                                           body=parent_query, request_timeout=timeout, size=100)
+        feed_to_child = parse_parent_response(parent_response, parent_query_key)
+        query_for_child = {"query": {"terms": {child_query_key: feed_to_child}}}
+        query_for_child.update(child_query)
+        child_response = es_client.search(index=child_query_index, body=query_for_child, request_timeout=timeout,
+                                          size=0)
+        metrics = parse_response(child_response, [query_name])
+        metric_dict = group_metrics(metrics)
+    except Exception:
+        log.exception('Error while running chained queries')
 
         # If this query has successfully run before, we need to handle any
         # metrics produced by that previous run.
@@ -528,11 +591,12 @@ def cli(**options):
     scheduler = sched.scheduler()
     indices_for_stats = []
     config = None
+    config_file_ext = '*.cfg'
     if not options['query_disable']:
         config = configparser.ConfigParser(converters=CONFIGPARSER_CONVERTERS)
         config.read(options['config_file'])
 
-        config_dir_file_pattern = os.path.join(options['config_dir'], '*.cfg')
+        config_dir_file_pattern = os.path.join(options['config_dir'], config_file_ext)
         config_dir_sorted_files = sorted(glob.glob(config_dir_file_pattern))
         config.read(config_dir_sorted_files)
 
@@ -557,11 +621,34 @@ def cli(**options):
                                        on_error, on_missing)
 
         if queries:
-            for query_name, (interval, timeout, indices, query,
-                             on_error, on_missing) in queries.items():
-                schedule_job(scheduler, interval,
-                             run_query, es_client, query_name, indices, query,
-                             timeout, on_error, on_missing)
+            for query_name, (interval, timeout, indices, query, on_error, on_missing) in queries.items():
+                schedule_job(scheduler, interval, run_query, es_client, query_name, indices, query, timeout, on_error,
+                             on_missing)
+        else:
+            log.error('No queries found in config file(s)')
+            return
+
+        chain_query_prefix = 'chain_query_'
+        chain_queries = {}
+        for section in config.sections():
+            if section.startswith(chain_query_prefix):
+                query_name = section[len(chain_query_prefix):]
+                interval = config.getfloat(section, 'QueryIntervalSecs',
+                                           fallback=15)
+                timeout = config.getfloat(section, 'QueryTimeoutSecs',
+                                          fallback=10)
+                query_def = json.loads(config.get(section, 'QueryJson'))
+                on_error = config.getenum(section, 'QueryOnError',
+                                          fallback='drop')
+                on_missing = config.getenum(section, 'QueryOnMissing',
+                                            fallback='drop')
+
+                chain_queries[query_name] = (interval, timeout, query_def, on_error, on_missing)
+
+        if chain_queries:
+            for query_name, (interval, timeout, query_def, on_error, on_missing) in chain_queries.items():
+                schedule_job(scheduler, interval, run_chain_query, es_client, query_name, query_def, timeout, on_error,
+                             on_missing)
         else:
             log.error('No queries found in config file(s)')
             return
@@ -597,7 +684,7 @@ def cli(**options):
         config = configparser.ConfigParser(converters=CONFIGPARSER_CONVERTERS)
         config.read(options['config_file'])
 
-        config_dir_file_pattern = os.path.join(options['config_dir'], '*.cfg')
+        config_dir_file_pattern = os.path.join(options['config_dir'], config_file_ext)
         config_dir_sorted_files = sorted(glob.glob(config_dir_file_pattern))
         config.read(config_dir_sorted_files)
 

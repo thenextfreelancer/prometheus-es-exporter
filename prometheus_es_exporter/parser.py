@@ -105,3 +105,19 @@ def parse_response(response, metric=None):
         for metric_name, metric_doc, label_dict, value
         in metrics
     ]
+
+
+def parse_parent_response(response, key):
+    if not response['timed_out']:
+        total = response['hits']['total']
+        # In ES7, hits.total changed from an integer to
+        # a dict with a 'value' key.
+        if isinstance(total, dict):
+            total = total['value']
+
+        data_list = response['hits']['hits']
+        filter_data = []
+        for data in data_list:
+            filter_data.append(data['_source'][key])
+        return filter_data
+
