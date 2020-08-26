@@ -60,3 +60,9 @@ target/
 
 # Gedit
 *~
+
+# Supporting Files
+__main__.py
+exporter.test.cfg
+.idea/
+.gitignore
