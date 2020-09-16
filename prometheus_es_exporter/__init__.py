@@ -8,10 +8,12 @@ import os
 import sched
 import time
 
+from threading import Thread
 from elasticsearch import Elasticsearch
 from elasticsearch.exceptions import ConnectionTimeout
 from jog import JogFormatter
-from prometheus_client import start_http_server
+from prometheus_client import make_wsgi_app
+from wsgiref.simple_server import make_server
 from prometheus_client.core import GaugeMetricFamily, REGISTRY
 
 from . import cluster_health_parser
@@ -32,7 +34,7 @@ CONTEXT_SETTINGS = {
 }
 
 METRICS_BY_QUERY = {}
-
+metrics_app = make_wsgi_app()
 
 def collector_up_gauge(name_list, description, succeeded=True):
     metric_name = format_metric_name(*name_list, 'up')
@@ -687,15 +689,34 @@ def cli(**options):
     if scheduler:
         REGISTRY.register(QueryMetricCollector())
 
-    log.info('Starting server...')
-    start_http_server(port)
-    log.info('Server started on port %(port)s', {'port': port})
+    Thread(target=start_prometheus_server, args=(port,)).start()
+    Thread(target=start_scheduler, args=(scheduler,)).start()
 
+
+def start_scheduler(scheduler):
+    log.info('Starting schedule run...')
     if scheduler:
         scheduler.run()
     else:
         while True:
             time.sleep(5)
+
+
+def start_prometheus_server(port):
+    log.info('Starting server...')
+    httpd = make_server('', port, controller)
+    log.info('Server started on port %(port)s', {'port': port})
+    httpd.serve_forever()
+
+
+def controller(environ, start_fn):
+    if environ['PATH_INFO'] == '/metrics':
+        return metrics_app(environ, start_fn)
+    if environ['PATH_INFO'] == '/health':
+        start_fn('200 OK', [])
+        return [b'{"success": True}']
+    start_fn('400 Error', [])
+    return [b'{"success": false}']
 
 
 @log_exceptions(exit_on_exception=True)
